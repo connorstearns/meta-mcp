@@ -220,20 +220,29 @@ def health():
 async def rpc(request: Request):
     payload = await request.json()
     method = payload.get("method")
+    _id = payload.get("id")
 
     if method == "initialize":
         result = {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": TOOLS
+            "tools": TOOLS,
         }
-        return JSONResponse({"jsonrpc":"2.0","id":payload.get("id"),"result": result})
+        return JSONResponse({"jsonrpc": "2.0", "id": _id, "result": result})
+
+    if method == "tools/list":
+        # Let the client discover available tools
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": _id,
+            "result": {"tools": TOOLS}
+        })
 
     if method == "tools/call":
-        params = payload.get("params", {}) or {}
+        params = payload.get("params") or {}
         name = params.get("name")
-        args = params.get("arguments", {}) or {}
+        args = params.get("arguments") or {}
         try:
             if name == "list_ads":
                 data = tool_list_ads(args)
@@ -244,16 +253,27 @@ async def rpc(request: Request):
             elif name == "audit_ads":
                 data = tool_audit_ads(args)
             else:
-                return JSONResponse({"jsonrpc":"2.0","id":payload.get("id"),
-                    "error":{"code":-32601,"message":f"Unknown tool: {name}"}}, status_code=400)
+                # JSON-RPC error with HTTP 200
+                return JSONResponse({
+                    "jsonrpc": "2.0", "id": _id,
+                    "error": {"code": -32601, "message": f"Unknown tool: {name}"}
+                })
 
-            # MCP-style content envelope
-            out = {"content":[{"type":"json","json": data}]}
-            return JSONResponse({"jsonrpc":"2.0","id":payload.get("id"),"result": out})
+            # MCP-style envelope
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": _id,
+                "result": {"content": [{"type": "json", "json": data}]}
+            })
         except FBError as e:
-            return JSONResponse({"jsonrpc":"2.0","id":payload.get("id"),
-                "error":{"code":-32000,"message":str(e)}}, status_code=400)
+            return JSONResponse({
+                "jsonrpc": "2.0", "id": _id,
+                "error": {"code": -32000, "message": str(e)}
+            })
 
-    # Fallback: method not found
-    return JSONResponse({"jsonrpc":"2.0","id":payload.get("id"),
-                         "error":{"code":-32601,"message":"Method not found"}}, status_code=404)
+    # Fallback: method not found (HTTP 200 per JSON-RPC)
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": _id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"}
+    })
