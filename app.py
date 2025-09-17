@@ -1,42 +1,92 @@
-import os, time, json, math, requests
+# app.py
+import os, time, json, random, logging
+from typing import Dict, Any, List, Optional
+
+import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 APP_NAME = "mcp-meta"
-APP_VER  = "0.1.0"
+APP_VER  = "0.2.0"  # web-friendly revision
 META_API_VERSION = os.getenv("META_API_VERSION", "v23.0")
-ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")  # injected via Secret Manager
-GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
+ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN")  # injected from Secret Manager
+GRAPH            = f"https://graph.facebook.com/{META_API_VERSION}"
+
+# Optional: shared secret to block random internet callers.
+MCP_SHARED_KEY   = os.getenv("MCP_SHARED_KEY", "").strip()
+
+# ----------------------------- FastAPI app & middleware -----------------------------
 
 app = FastAPI()
+log = logging.getLogger("mcp-meta")
+logging.basicConfig(level=logging.INFO)
 
-# ---------- helpers ----------
+# CORS: Claude Web runs in a browser context
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten to specific origins if you like
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id"],
+)
+
+# Always surface MCP-Protocol-Version so clients can see it
+class MCPProtocolHeader(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        proto = request.headers.get("Mcp-Protocol-Version") or "2025-06-18"
+        response = await call_next(request)
+        response.headers["MCP-Protocol-Version"] = proto
+        return response
+
+app.add_middleware(MCPProtocolHeader)
+
+# ----------------------------- HTTP client (pooling + retries) ---------------------
+
 class FBError(Exception): pass
 
-def g(path, params=None):
-    if params is None: params = {}
-    params["access_token"] = ACCESS_TOKEN
-    url = f"{GRAPH}/{path.lstrip('/')}"
-    t0 = time.time()
-    r = requests.get(url, params=params, timeout=60)
-    if r.status_code >= 400:
-        try:
-            j = r.json()
-        except Exception:
-            j = {"error": {"message": r.text}}
-        raise FBError(j.get("error", {}).get("message", r.text))
-    app.logger if hasattr(app, "logger") else None
-    return r.json()
+_session = requests.Session()
+_adapter  = requests.adapters.HTTPAdapter(
+    max_retries=0, pool_connections=20, pool_maxsize=50
+)
+_session.mount("https://", _adapter)
 
-def chunk(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+_TRANSIENT_CODES = {"1","2","4","17","32","613"}  # common transient Meta error codes
 
-def ensure_token():
+def _ensure_token():
     if not ACCESS_TOKEN:
         raise FBError("META_ACCESS_TOKEN is not set")
 
-# ---------- MCP describe tools ----------
+def g(path: str, params: Optional[Dict[str, Any]] = None, max_attempts: int = 5) -> Dict[str, Any]:
+    _ensure_token()
+    if params is None: params = {}
+    params["access_token"] = ACCESS_TOKEN
+    url = f"{GRAPH}/{path.lstrip('/')}"
+    for attempt in range(1, max_attempts + 1):
+        r = _session.get(url, params=params, timeout=60)
+        if r.status_code < 400:
+            return r.json()
+        # parse error
+        try:
+            err = r.json().get("error", {})
+        except Exception:
+            err = {"message": r.text, "code": "unknown"}
+        code = str(err.get("code"))
+        fbtrace = err.get("fbtrace_id")
+        msg = f"{err.get('message')} (code={code}, fbtrace_id={fbtrace})"
+        # transient -> retry with jitter
+        if code in _TRANSIENT_CODES and attempt < max_attempts:
+            time.sleep(min(2**attempt, 20) + random.random())
+            continue
+        raise FBError(msg)
+
+def _chunk(seq: List[str], n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+# ----------------------------- Tools descriptor ------------------------------------
+
 TOOLS = [
     {
         "name": "list_ads",
@@ -99,39 +149,34 @@ TOOLS = [
     }
 ]
 
-# ---------- Tool implementations ----------
-def tool_list_ads(args):
-    ensure_token()
+# ----------------------------- Tool implementations --------------------------------
+
+def tool_list_ads(args: Dict[str, Any]) -> Dict[str, Any]:
     account_id = args["account_id"]
     limit = int(args.get("limit", 50))
     after = args.get("after")
     fields = "id,name,effective_status,adset{id,name},campaign{id,name},creative{id}"
     params = {"fields": fields, "limit": limit}
     if after: params["after"] = after
-    data = g(f"{account_id}/ads", params)
-    return data
+    return g(f"{account_id}/ads", params)
 
-def _creative_fields():
+def _creative_fields() -> str:
     return "object_story_spec,asset_feed_spec,url_tags,ad_creative_features_spec"
 
-def tool_get_ad_creatives(args):
-    ensure_token()
-    out = {}
-    if "creative_ids" in args:
-        for batch in chunk(args["creative_ids"], 25):
+def tool_get_ad_creatives(args: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if "creative_ids" in args and args["creative_ids"]:
+        for batch in _chunk(args["creative_ids"], 25):
             ids = ",".join(batch)
             res = g("", params={"ids": ids, "fields": _creative_fields()})
             out.update({k: v for k, v in res.items()})
     else:
-        # by ad ids
         for ad_id in args["ad_ids"]:
             res = g(f"{ad_id}", params={"fields": f"creative{{{_creative_fields()}}}"})
-            cr = res.get("creative", {})
-            out[ad_id] = cr
+            out[ad_id] = res.get("creative", {}) or {}
     return out
 
-def tool_get_insights(args):
-    ensure_token()
+def tool_get_insights(args: Dict[str, Any]) -> Dict[str, Any]:
     scope_id   = args["scope_id"]
     level      = args.get("level", "ad")
     fields     = args.get("fields") or ["ad_id","ad_name","spend","impressions","clicks","cpc","cpm","ctr"]
@@ -148,101 +193,142 @@ def tool_get_insights(args):
     if after: params["after"] = after
     return g(f"{scope_id}/insights", params)
 
-def lint_issue(kind, detail):
+def _lint_issue(kind: str, detail: str) -> Dict[str, str]:
     return {"type": kind, "detail": detail}
 
-def tool_audit_ads(args):
-    ensure_token()
+def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
     ad_ids = args["ad_ids"]
     rules  = {"max_primary_text":125, "max_headline":40}
-    rules.update(args.get("rules", {}))
+    rules.update(args.get("rules", {}) or {})
 
     raw = tool_get_ad_creatives({"ad_ids": ad_ids})
     findings = []
     for ad_id, creative in raw.items():
         issues = []
-        # Extract primary text / headline / link(s)
-        bodies = []
-        titles = []
-        links  = []
+        bodies: List[str] = []
+        titles: List[str] = []
+        links:  List[str] = []
         url_tags = None
 
-        # object_story_spec.link_data
         oss = (creative or {}).get("object_story_spec", {}) or {}
         ld  = oss.get("link_data", {}) or {}
         if ld.get("message"): bodies.append(ld["message"])
-        if ld.get("name"): titles.append(ld["name"])
-        if ld.get("link"): links.append(ld["link"])
-        url_tags = creative.get("url_tags") or ld.get("call_to_action", {}).get("value", {}).get("link")
+        if ld.get("name"):    titles.append(ld["name"])
+        if ld.get("link"):    links.append(ld["link"])
+        url_tags = (creative or {}).get("url_tags") or ld.get("call_to_action", {}).get("value", {}).get("link")
 
-        # asset_feed_spec (multiple variants)
         afs = (creative or {}).get("asset_feed_spec", {}) or {}
-        bodies += afs.get("bodies", [])
-        titles += afs.get("titles", [])
-        links  += afs.get("link_urls", [])
+        bodies += [x for x in afs.get("bodies", []) if x]
+        titles += [x for x in afs.get("titles", []) if x]
+        links  += [x for x in afs.get("link_urls", []) if x]
 
         # Copy length checks
-        for b in bodies:
-            if b and len(b) > rules["max_primary_text"]:
-                issues.append(lint_issue("primary_text_length", f"{len(b)} chars > {rules['max_primary_text']}"))
-        for t in titles:
-            if t and len(t) > rules["max_headline"]:
-                issues.append(lint_issue("headline_length", f"{len(t)} chars > {rules['max_headline']}"))
+        for b in set(bodies):
+            if len(b) > rules["max_primary_text"]:
+                issues.append(_lint_issue("primary_text_length", f"{len(b)} chars > {rules['max_primary_text']}"))
+        for t in set(titles):
+            if len(t) > rules["max_headline"]:
+                issues.append(_lint_issue("headline_length", f"{len(t)} chars > {rules['max_headline']}"))
 
         # URL hygiene
-        for u in links:
-            if u and not str(u).lower().startswith("https://"):
-                issues.append(lint_issue("non_https_url", u))
+        for u in set(links):
+            if not str(u).lower().startswith("https://"):
+                issues.append(_lint_issue("non_https_url", str(u)))
         if url_tags is None or str(url_tags).strip() == "":
-            issues.append(lint_issue("missing_url_tags", "No UTM or url_tags found"))
+            issues.append(_lint_issue("missing_url_tags", "No UTM or url_tags found"))
 
         # Variant coverage
-        if len(bodies) <= 1 or len(titles) <= 1:
-            issues.append(lint_issue("low_variant_coverage",
-                        f"bodies={len(bodies)} titles={len(titles)}"))
+        if len(set(bodies)) <= 1 or len(set(titles)) <= 1:
+            issues.append(_lint_issue("low_variant_coverage",
+                                      f"bodies={len(set(bodies))} titles={len(set(titles))}"))
 
-        # Advantage+ flags visibility (just return the struct if present)
         flags = (creative or {}).get("ad_creative_features_spec", None)
+        findings.append({"ad_id": ad_id, "issues": issues, "ad_creative_features_spec": flags})
 
-        findings.append({
-            "ad_id": ad_id,
-            "issues": issues,
-            "ad_creative_features_spec": flags
-        })
     return {"results": findings}
 
-# ---------- MCP JSON-RPC endpoint ----------
-@app.get("/")
-def health():
+# ----------------------------- Health & discovery ----------------------------------
+
+@app.get("/", include_in_schema=False)
+async def root_get(request: Request):
+    # SSE keep-alive if a client asks for it
+    accept = (request.headers.get("accept") or "").lower()
+    if "text/event-stream" in accept:
+        async def stream():
+            yield b": connected\n\n"
+            while True:
+                await asyncio.sleep(25)  # type: ignore
+                yield b": ping\n\n"
+        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
+        return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
     return PlainTextResponse("ok")
+
+@app.options("/{_any:path}")
+async def any_options(_any: str):
+    # CORS preflight for any path
+    return PlainTextResponse("", status_code=204)
+
+@app.get("/.well-known/mcp.json")
+def mcp_discovery():
+    return JSONResponse({
+        "mcpVersion": "1.0",
+        "name": APP_NAME,
+        "version": APP_VER,
+        "auth": {"type": "none"},
+        "tools": TOOLS
+    })
+
+@app.get("/mcp/tools")
+def mcp_tools():
+    return JSONResponse({"tools": TOOLS})
+
+# ----------------------------- JSON-RPC core ---------------------------------------
+
+def _authz_check(request: Request) -> Optional[JSONResponse]:
+    # Optional shared-secret check (only if MCP_SHARED_KEY is set)
+    if MCP_SHARED_KEY:
+        key = request.headers.get("X-MCP-Key") or ""
+        if key != MCP_SHARED_KEY:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32001, "message": "Unauthorized"}},
+                status_code=200
+            )
+    return None
 
 @app.post("/")
 async def rpc(request: Request):
-    payload = await request.json()
+    # Optional shared-secret
+    maybe = _authz_check(request)
+    if maybe: return maybe
+
+    # Accept body from catch-all if already parsed
+    payload = getattr(request.state, "json_payload", None)
+    if payload is None:
+        payload = await request.json()
     method = payload.get("method")
-    _id = payload.get("id")
+    _id     = payload.get("id")
+    log.info(f"RPC method: {method}")
 
     if method == "initialize":
         result = {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": TOOLS,
+            "tools": TOOLS
         }
-        return JSONResponse({"jsonrpc": "2.0", "id": _id, "result": result})
+        return JSONResponse({"jsonrpc":"2.0","id":_id,"result": result})
+
+    if method in ("initialized", "notifications/initialized"):
+        return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
 
     if method == "tools/list":
-        # Let the client discover available tools
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": _id,
-            "result": {"tools": TOOLS}
-        })
+        return JSONResponse({"jsonrpc":"2.0","id":_id,"result": {"tools": TOOLS}})
 
     if method == "tools/call":
         params = payload.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
+        name   = params.get("name")
+        args   = params.get("arguments") or {}
         try:
             if name == "list_ads":
                 data = tool_list_ads(args)
@@ -253,27 +339,35 @@ async def rpc(request: Request):
             elif name == "audit_ads":
                 data = tool_audit_ads(args)
             else:
-                # JSON-RPC error with HTTP 200
-                return JSONResponse({
-                    "jsonrpc": "2.0", "id": _id,
-                    "error": {"code": -32601, "message": f"Unknown tool: {name}"}
-                })
-
-            # MCP-style envelope
-            return JSONResponse({
-                "jsonrpc": "2.0",
-                "id": _id,
-                "result": {"content": [{"type": "json", "json": data}]}
-            })
+                return JSONResponse({"jsonrpc":"2.0","id":_id,
+                    "error":{"code":-32601,"message":f"Unknown tool: {name}"}})
+            return JSONResponse({"jsonrpc":"2.0","id":_id,
+                "result":{"content":[{"type":"json","json": data}]}})
         except FBError as e:
-            return JSONResponse({
-                "jsonrpc": "2.0", "id": _id,
-                "error": {"code": -32000, "message": str(e)}
-            })
+            return JSONResponse({"jsonrpc":"2.0","id":_id,
+                                 "error":{"code":-32000,"message":str(e)}})
 
-    # Fallback: method not found (HTTP 200 per JSON-RPC)
-    return JSONResponse({
-        "jsonrpc": "2.0",
-        "id": _id,
-        "error": {"code": -32601, "message": f"Method not found: {method}"}
-    })
+    # Fallback JSON-RPC error (HTTP 200 as per JSON-RPC)
+    return JSONResponse({"jsonrpc":"2.0","id":_id,
+                         "error":{"code":-32601,"message":f"Method not found: {method}"}})
+
+# Catch-all POST (handles /register and friends)
+@app.post("/{_catchall:path}")
+async def rpc_catch(request: Request, _catchall: str):
+    # Optional shared-secret
+    maybe = _authz_check(request)
+    if maybe: return maybe
+
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict) and "method" in payload:
+            request.state.json_payload = payload
+            return await rpc(request)
+    except Exception:
+        pass
+    return PlainTextResponse("ok")
+
+# ----------------------------- Local dev entrypoint --------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
