@@ -35,7 +35,7 @@ app.add_middleware(
 # Always surface MCP-Protocol-Version so clients can see it
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        proto = request.headers.get("Mcp-Protocol-Version") or "2025-06-18"
+        proto = request.headers.get("Mcp-Protocol-Version") or "2024-11-05"
         response = await call_next(request)
         response.headers["MCP-Protocol-Version"] = proto
         return response
@@ -311,13 +311,17 @@ async def rpc(request: Request):
     log.info(f"RPC method: {method}")
 
     if method == "initialize":
+        client_proto = (payload.get("params") or {}).get("protocolVersion") or "2024-11-05"
         result = {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
+            "protocolVersion": client_proto,
+            "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
             "tools": TOOLS
         }
-        return JSONResponse({"jsonrpc":"2.0","id":_id,"result": result})
+        return JSONResponse(
+        {"jsonrpc":"2.0","id":_id,"result": result},
+        headers={"MCP-Protocol-Version": client_proto}
+    )
 
     if method in ("initialized", "notifications/initialized"):
         return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
