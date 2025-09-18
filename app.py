@@ -42,6 +42,13 @@ app.add_middleware(
     expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id"],
 )
 
+@app.middleware("http")
+async def _reqlog(request: Request, call_next):
+    log.info("REQ %s %s Origin=%s", request.method, request.url.path, request.headers.get("origin"))
+    resp = await call_next(request)
+    log.info("RESP %s %s %s", request.method, request.url.path, resp.status_code)
+    return resp
+
 # Always surface MCP-Protocol-Version so clients can see it
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -292,29 +299,15 @@ def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
 @app.get("/", include_in_schema=False)
 @app.head("/", include_in_schema=False)
 async def root_get(request: Request):
-    # Fast 200 for HEAD
     if request.method == "HEAD":
         return PlainTextResponse("")
-
-    # Optional SSE keep-alive (safe to keep; remove if you don't need it)
-    accept = (request.headers.get("accept") or "").lower()
-    if "text/event-stream" in accept:
-        async def stream():
-            yield b": connected\n\n"
-            while True:
-                await asyncio.sleep(25)
-                yield b": ping\n\n"
-        headers = {"Cache-Control":"no-store","Connection":"keep-alive"}
-        return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
-
     return PlainTextResponse("ok")
 
-# CORS preflight (any path)
 @app.options("/{_any:path}")
 async def any_options(_any: str):
     return PlainTextResponse("", status_code=204)
 
-# OAuth discovery stubs (avoid 405 during connector probes)
+# OAuth discovery stubs (avoid 405s)
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
 async def oauth_pr():
     return JSONResponse({"ok": False, "error": "oauth discovery not configured"}, status_code=404)
@@ -323,20 +316,31 @@ async def oauth_pr():
 async def oauth_as():
     return JSONResponse({"ok": False, "error": "oauth discovery not configured"}, status_code=404)
 
-# MCP discovery endpoints
+# MCP discovery
 @app.get("/.well-known/mcp.json")
 def mcp_discovery():
     return JSONResponse({
-        "mcpVersion": "1.0",
+        "mcpVersion": "2024-11-05",
         "name": APP_NAME,
         "version": APP_VER,
         "auth": {"type": "none"},
+        "capabilities": {"tools": {"listChanged": True}},
+        "endpoints": {"rpc": "/"},
         "tools": TOOLS
     })
 
 @app.get("/mcp/tools")
 def mcp_tools():
     return JSONResponse({"tools": TOOLS})
+
+# /register probes (explicit 200 JSON)
+@app.get("/register", include_in_schema=False)
+def register_get():
+    return JSONResponse({"ok": True})
+
+@app.post("/register", include_in_schema=False)
+def register_post():
+    return JSONResponse({"ok": True})
 
 # ----------------------------- JSON-RPC core ---------------------------------------
 
@@ -382,8 +386,8 @@ async def rpc(request: Request):
     if method in ("initialized", "notifications/initialized"):
         return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
 
-    if method == "tools/list":
-        return JSONResponse({"jsonrpc":"2.0","id":_id,"result": {"tools": TOOLS}})
+    if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
+    return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
 
     if method == "tools/call":
         params = payload.get("params") or {}
