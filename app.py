@@ -16,19 +16,27 @@ META_API_VERSION = os.getenv("META_API_VERSION", "v23.0")
 ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN")  # injected from Secret Manager
 GRAPH            = f"https://graph.facebook.com/{META_API_VERSION}"
 
+# ---------- Logging & shared-secret setup (define BEFORE using) ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("mcp-meta")
+
 # Optional: shared secret to block random internet callers.
-MCP_SHARED_KEY   = os.getenv("MCP_SHARED_KEY", "").strip()
+MCP_SHARED_KEY = os.getenv("MCP_SHARED_KEY", "").strip()
+log.info("MCP_SHARED_KEY enabled? %s", "YES" if MCP_SHARED_KEY else "NO")
 
 # ----------------------------- FastAPI app & middleware -----------------------------
-
 app = FastAPI()
-log = logging.getLogger("mcp-meta")
-logging.basicConfig(level=logging.INFO)
 
-# CORS: Claude Web runs in a browser context
+CLAUDE_ORIGINS = [
+    "https://claude.ai",
+    "https://www.claude.ai",
+    "https://console.anthropic.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to specific origins if you like
+    allow_origins=CLAUDE_ORIGINS,      # must be explicit when allow_credentials=True
+    allow_credentials=True,            # important for browser clients
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id"],
@@ -279,15 +287,16 @@ def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"results": findings}
 
-# -----------------------------  discovery ----------------------------------
+# ----------------------------- Health & discovery ----------------------------------
 
 @app.get("/", include_in_schema=False)
-@app.head("/", include_in_schema=False)  # add this
+@app.head("/", include_in_schema=False)
 async def root_get(request: Request):
-    # For HEAD, just return 200 quickly
+    # Fast 200 for HEAD
     if request.method == "HEAD":
         return PlainTextResponse("")
 
+    # Optional SSE keep-alive (safe to keep; remove if you don't need it)
     accept = (request.headers.get("accept") or "").lower()
     if "text/event-stream" in accept:
         async def stream():
@@ -300,11 +309,21 @@ async def root_get(request: Request):
 
     return PlainTextResponse("ok")
 
+# CORS preflight (any path)
 @app.options("/{_any:path}")
 async def any_options(_any: str):
-    # CORS preflight for any path
     return PlainTextResponse("", status_code=204)
 
+# OAuth discovery stubs (avoid 405 during connector probes)
+@app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
+async def oauth_pr():
+    return JSONResponse({"ok": False, "error": "oauth discovery not configured"}, status_code=404)
+
+@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
+async def oauth_as():
+    return JSONResponse({"ok": False, "error": "oauth discovery not configured"}, status_code=404)
+
+# MCP discovery endpoints
 @app.get("/.well-known/mcp.json")
 def mcp_discovery():
     return JSONResponse({
