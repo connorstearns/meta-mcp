@@ -206,8 +206,8 @@ def tool_get_insights(args: Dict[str, Any]) -> Dict[str, Any]:
 
     params = {"level": level, "fields": ",".join(fields), "limit": limit}
     if breakdowns: params["breakdowns"] = ",".join(breakdowns)
-    if date_preset: params["date_preset"] = date_preset
-    if time_range: params["time_range"] = json.dumps(time_range)
+    if date_preset and time_range:
+        date_preset = None
     if after: params["after"] = after
     return g(f"{scope_id}/insights", params)
 
@@ -387,7 +387,7 @@ async def rpc(request: Request):
         return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
 
     if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
-    return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
+        return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
 
     if method == "tools/call":
         params = payload.get("params") or {}
@@ -418,7 +418,6 @@ async def rpc(request: Request):
 # Catch-all POST (handles /register and friends)
 @app.post("/{_catchall:path}")
 async def rpc_catch(request: Request, _catchall: str):
-    # Optional shared-secret
     maybe = _authz_check(request)
     if maybe: return maybe
 
@@ -429,7 +428,7 @@ async def rpc_catch(request: Request, _catchall: str):
             return await rpc(request)
     except Exception:
         pass
-    return PlainTextResponse("ok")
+    return JSONResponse({"ok": True})   # <— was PlainTextResponse("ok")
 
 # ----------------------------- Local dev entrypoint --------------------------------
 if __name__ == "__main__":
