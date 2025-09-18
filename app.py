@@ -163,7 +163,8 @@ def tool_list_ads(args: Dict[str, Any]) -> Dict[str, Any]:
     return g(f"{account_id}/ads", params)
 
 def _creative_fields() -> str:
-    return "object_story_spec,asset_feed_spec,url_tags,ad_creative_features_spec"
+    # ask for the right fields; 'ad_creative_features_spec' → 'creative_features_spec'
+    return "object_story_spec,asset_feed_spec,url_tags,creative_features_spec,degrees_of_freedom_spec"
 
 def tool_get_ad_creatives(args: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -200,52 +201,84 @@ def _lint_issue(kind: str, detail: str) -> Dict[str, str]:
 
 def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
     ad_ids = args["ad_ids"]
-    rules  = {"max_primary_text":125, "max_headline":40}
+    rules  = {"max_primary_text": 125, "max_headline": 40}
     rules.update(args.get("rules", {}) or {})
 
     raw = tool_get_ad_creatives({"ad_ids": ad_ids})
-    findings = []
+    findings: List[Dict[str, Any]] = []
+
     for ad_id, creative in raw.items():
-        issues = []
+        issues: List[Dict[str, str]] = []
         bodies: List[str] = []
         titles: List[str] = []
         links:  List[str] = []
-        url_tags = None
 
+        # --- extract creative pieces ---
         oss = (creative or {}).get("object_story_spec", {}) or {}
         ld  = oss.get("link_data", {}) or {}
+        url_tags = (creative or {}).get("url_tags")  # only tags here
+
+        # primary text / headline / link(s)
         if ld.get("message"): bodies.append(ld["message"])
         if ld.get("name"):    titles.append(ld["name"])
         if ld.get("link"):    links.append(ld["link"])
-        url_tags = (creative or {}).get("url_tags") or ld.get("call_to_action", {}).get("value", {}).get("link")
 
+        # CTA link is also a link (not tags)
+        cta_link = ld.get("call_to_action", {}).get("value", {}).get("link")
+        if cta_link:
+            links.append(cta_link)
+
+        # asset feed variants
         afs = (creative or {}).get("asset_feed_spec", {}) or {}
         bodies += [x for x in afs.get("bodies", []) if x]
         titles += [x for x in afs.get("titles", []) if x]
         links  += [x for x in afs.get("link_urls", []) if x]
 
-        # Copy length checks
-        for b in set(bodies):
+        # Advantage+ / creative features flags
+        flags = (
+            (creative or {}).get("creative_features_spec")
+            or (creative or {}).get("degrees_of_freedom_spec", {}).get("creative_features_spec")
+        )
+
+        # --- lints ---
+        uniq_bodies = {b for b in bodies if isinstance(b, str)}
+        uniq_titles = {t for t in titles if isinstance(t, str)}
+        uniq_links  = {u for u in links  if isinstance(u, str)}
+
+        # copy length
+        for b in uniq_bodies:
             if len(b) > rules["max_primary_text"]:
-                issues.append(_lint_issue("primary_text_length", f"{len(b)} chars > {rules['max_primary_text']}"))
-        for t in set(titles):
+                issues.append(_lint_issue("primary_text_length",
+                                          f"{len(b)} chars > {rules['max_primary_text']}"))
+        for t in uniq_titles:
             if len(t) > rules["max_headline"]:
-                issues.append(_lint_issue("headline_length", f"{len(t)} chars > {rules['max_headline']}"))
+                issues.append(_lint_issue("headline_length",
+                                          f"{len(t)} chars > {rules['max_headline']}"))
 
         # URL hygiene
-        for u in set(links):
-            if not str(u).lower().startswith("https://"):
-                issues.append(_lint_issue("non_https_url", str(u)))
-        if url_tags is None or str(url_tags).strip() == "":
+        for u in uniq_links:
+            if not u.lower().startswith("https://"):
+                issues.append(_lint_issue("non_https_url", u))
+        if url_tags is None or (isinstance(url_tags, str) and url_tags.strip() == ""):
             issues.append(_lint_issue("missing_url_tags", "No UTM or url_tags found"))
 
-        # Variant coverage
-        if len(set(bodies)) <= 1 or len(set(titles)) <= 1:
+        # variant coverage
+        if len(uniq_bodies) <= 1 or len(uniq_titles) <= 1:
             issues.append(_lint_issue("low_variant_coverage",
-                                      f"bodies={len(set(bodies))} titles={len(set(titles))}"))
+                                      f"bodies={len(uniq_bodies)} titles={len(uniq_titles)}"))
 
-        flags = (creative or {}).get("ad_creative_features_spec", None)
-        findings.append({"ad_id": ad_id, "issues": issues, "ad_creative_features_spec": flags})
+        # append per-ad result
+        findings.append({
+            "ad_id": ad_id,
+            "issues": issues,
+            "creative_features_spec": flags,
+            "summary": {
+                "unique_bodies": len(uniq_bodies),
+                "unique_titles": len(uniq_titles),
+                "unique_links": len(uniq_links),
+                "has_url_tags": bool(url_tags)
+            }
+        })
 
     return {"results": findings}
 
