@@ -279,20 +279,25 @@ def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"results": findings}
 
-# ----------------------------- Health & discovery ----------------------------------
+# -----------------------------  discovery ----------------------------------
 
 @app.get("/", include_in_schema=False)
+@app.head("/", include_in_schema=False)  # add this
 async def root_get(request: Request):
-    # SSE keep-alive if a client asks for it
+    # For HEAD, just return 200 quickly
+    if request.method == "HEAD":
+        return PlainTextResponse("")
+
     accept = (request.headers.get("accept") or "").lower()
     if "text/event-stream" in accept:
         async def stream():
             yield b": connected\n\n"
             while True:
-                await asyncio.sleep(25)  # type: ignore
+                await asyncio.sleep(25)
                 yield b": ping\n\n"
-        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
+        headers = {"Cache-Control":"no-store","Connection":"keep-alive"}
         return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
+
     return PlainTextResponse("ok")
 
 @app.options("/{_any:path}")
