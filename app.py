@@ -163,8 +163,8 @@ def tool_list_ads(args: Dict[str, Any]) -> Dict[str, Any]:
     return g(f"{account_id}/ads", params)
 
 def _creative_fields() -> str:
-    # ask for the right fields; 'ad_creative_features_spec' → 'creative_features_spec'
-    return "object_story_spec,asset_feed_spec,url_tags,creative_features_spec,degrees_of_freedom_spec"
+    # In v23, creative_features_spec is nested under degrees_of_freedom_spec
+    return "object_story_spec,asset_feed_spec,url_tags,degrees_of_freedom_spec"
 
 def tool_get_ad_creatives(args: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -235,10 +235,7 @@ def tool_audit_ads(args: Dict[str, Any]) -> Dict[str, Any]:
         links  += [x for x in afs.get("link_urls", []) if x]
 
         # Advantage+ / creative features flags
-        flags = (
-            (creative or {}).get("creative_features_spec")
-            or (creative or {}).get("degrees_of_freedom_spec", {}).get("creative_features_spec")
-        )
+        flags = (creative or {}).get("degrees_of_freedom_spec", {}).get("creative_features_spec")
 
         # --- lints ---
         uniq_bodies = {b for b in bodies if isinstance(b, str)}
