@@ -204,10 +204,13 @@ def tool_get_insights(args: Dict[str, Any]) -> Dict[str, Any]:
     limit      = int(args.get("limit", 100))
     after      = args.get("after")
 
-    params = {"level": level, "fields": ",".join(fields), "limit": limit}
-    if breakdowns: params["breakdowns"] = ",".join(breakdowns)
     if date_preset and time_range:
         date_preset = None
+
+    params = {"level": level, "fields": ",".join(fields), "limit": limit}
+    if breakdowns: params["breakdowns"] = ",".join(breakdowns)
+    if date_preset: params["date_preset"] = date_preset
+    if time_range: params["time_range"] = json.dumps(time_range)
     if after: params["after"] = after
     return g(f"{scope_id}/insights", params)
 
@@ -358,77 +361,64 @@ def _authz_check(request: Request) -> Optional[JSONResponse]:
 
 @app.post("/")
 async def rpc(request: Request):
-    # Optional shared-secret
     maybe = _authz_check(request)
     if maybe: return maybe
-
-    # Accept body from catch-all if already parsed
-    payload = getattr(request.state, "json_payload", None)
-    if payload is None:
-        payload = await request.json()
-    method = payload.get("method")
-    _id     = payload.get("id")
-    log.info(f"RPC method: {method}")
-
-    if method == "initialize":
-        client_proto = (payload.get("params") or {}).get("protocolVersion") or "2024-11-05"
-        result = {
-            "protocolVersion": client_proto,
-            "capabilities": {"tools": {"listChanged": True}},
-            "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": TOOLS
-        }
-        return JSONResponse(
-        {"jsonrpc":"2.0","id":_id,"result": result},
-        headers={"MCP-Protocol-Version": client_proto}
-    )
-
-    if method in ("initialized", "notifications/initialized"):
-        return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
-
-    if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
-        return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
-
-    if method == "tools/call":
-        params = payload.get("params") or {}
-        name   = params.get("name")
-        args   = params.get("arguments") or {}
-        try:
-            if name == "list_ads":
-                data = tool_list_ads(args)
-            elif name == "get_ad_creatives":
-                data = tool_get_ad_creatives(args)
-            elif name == "get_insights":
-                data = tool_get_insights(args)
-            elif name == "audit_ads":
-                data = tool_audit_ads(args)
-            else:
-                return JSONResponse({"jsonrpc":"2.0","id":_id,
-                    "error":{"code":-32601,"message":f"Unknown tool: {name}"}})
-            return JSONResponse({"jsonrpc":"2.0","id":_id,
-                "result":{"content":[{"type":"json","json": data}]}})
-        except FBError as e:
-            return JSONResponse({"jsonrpc":"2.0","id":_id,
-                                 "error":{"code":-32000,"message":str(e)}})
-
-    # Fallback JSON-RPC error (HTTP 200 as per JSON-RPC)
-    return JSONResponse({"jsonrpc":"2.0","id":_id,
-                         "error":{"code":-32601,"message":f"Method not found: {method}"}})
-
-# Catch-all POST (handles /register and friends)
-@app.post("/{_catchall:path}")
-async def rpc_catch(request: Request, _catchall: str):
-    maybe = _authz_check(request)
-    if maybe: return maybe
-
     try:
-        payload = await request.json()
-        if isinstance(payload, dict) and "method" in payload:
-            request.state.json_payload = payload
-            return await rpc(request)
-    except Exception:
-        pass
-    return JSONResponse({"ok": True})   # <— was PlainTextResponse("ok")
+        payload = getattr(request.state, "json_payload", None) or await request.json()
+        method  = payload.get("method")
+        _id     = payload.get("id")
+        log.info(f"RPC method: {method}")
+
+        if method == "initialize":
+            client_proto = (payload.get("params") or {}).get("protocolVersion") or "2024-11-05"
+            result = {"protocolVersion": client_proto,
+                      "capabilities": {"tools": {"listChanged": True}},
+                      "serverInfo": {"name": APP_NAME, "version": APP_VER},
+                      "tools": TOOLS}
+            return JSONResponse({"jsonrpc":"2.0","id":_id,"result": result},
+                                headers={"MCP-Protocol-Version": client_proto})
+
+        if method in ("initialized", "notifications/initialized"):
+            return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
+
+        if method in ("tools/list","tools.list","list_tools","tools.index"):
+            return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
+
+        if method == "tools/call":
+            params = payload.get("params") or {}
+            name   = params.get("name")
+            args   = params.get("arguments") or {}
+
+            try:
+                if name == "list_ads":
+                    data = tool_list_ads(args)
+                elif name == "get_ad_creatives":
+                    data = tool_get_ad_creatives(args)
+                elif name == "get_insights":
+                    data = tool_get_insights(args)
+                elif name == "audit_ads":
+                    data = tool_audit_ads(args)
+                else:
+                    return JSONResponse({"jsonrpc":"2.0","id":_id,
+                        "error":{"code":-32601,"message":f"Unknown tool: {name}"}})
+                return JSONResponse({"jsonrpc":"2.0","id":_id,
+                    "result":{"content":[{"type":"json","json": data}]}})
+            except FBError as e:
+                log.exception("Tool call failed (FBError)")
+                return JSONResponse({"jsonrpc":"2.0","id":_id,
+                    "error":{"code":-32000,"message":str(e)}})
+            except Exception as e:
+                log.exception("Tool call failed (unexpected)")
+                return JSONResponse({"jsonrpc":"2.0","id":_id,
+                    "error":{"code":-32099,"message":f"Unhandled tool error: {e.__class__.__name__}: {e}"}})
+
+        # Unknown method
+        return JSONResponse({"jsonrpc":"2.0","id":_id,
+                             "error":{"code":-32601,"message":f"Method not found: {method}"}})
+    except Exception as e:
+        log.exception("RPC dispatch exploded")
+        return JSONResponse({"jsonrpc":"2.0","id":None,
+                             "error":{"code":-32098,"message":f"RPC dispatch error: {e.__class__.__name__}: {e}"}})
 
 # ----------------------------- Local dev entrypoint --------------------------------
 if __name__ == "__main__":
