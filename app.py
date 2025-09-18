@@ -27,18 +27,15 @@ log.info("MCP_SHARED_KEY enabled? %s", "YES" if MCP_SHARED_KEY else "NO")
 # ----------------------------- FastAPI app & middleware -----------------------------
 app = FastAPI()
 
-ALLOWED_ORIGINS = [
+CLAUDE_ORIGINS = [
     "https://claude.ai",
     "https://www.claude.ai",
     "https://console.anthropic.com",
-    "https://chatgpt.com",
-    "https://chat.openai.com",
-    "https://platform.openai.com",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=CLAUDE_ORIGINS,
     allow_credentials=True,            # important for browser clients
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
