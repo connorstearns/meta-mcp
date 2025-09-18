@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+import asyncio
+
 APP_NAME = "mcp-meta"
 APP_VER  = "0.2.0"  # web-friendly revision
 META_API_VERSION = os.getenv("META_API_VERSION", "v23.0")
